@@ -22,6 +22,7 @@ export default function ListenerView({
   const [muted, setMuted] = useState(false);
 
   // Playback state
+  const baseAudioTimeRef = useRef<number>(0);
   const playRef = useRef({ serverTimestamp: 0, audioPosition: 0, rate: 1 });
   const activeSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
 
@@ -67,12 +68,17 @@ export default function ListenerView({
       if (audioContextRef.current?.state === 'suspended') {
         audioContextRef.current.resume();
       }
-      
       playRef.current = {
         serverTimestamp: lastMessage.serverTimestamp,
         audioPosition: lastMessage.audioPosition,
         rate: lastMessage.playbackRate || 1
       };
+      
+      const trackVirtualStart = lastMessage.serverTimestamp - (lastMessage.audioPosition * 1000 / (lastMessage.playbackRate || 1));
+      const localPlayAt = trackVirtualStart + clockOffset;
+      const delaySeconds = (localPlayAt - Date.now()) / 1000;
+      
+      baseAudioTimeRef.current = audioContextRef.current!.currentTime + delaySeconds;
       
       // Stop all currently scheduled chunks (if seeking)
       activeSourcesRef.current.forEach(source => {
@@ -83,7 +89,7 @@ export default function ListenerView({
       setStatus('playing');
     }
     else if (lastMessage.action === 'pcm_chunk') {
-      if (!audioContextRef.current || !gainNodeRef.current) return;
+      if (!audioContextRef.current || !gainNodeRef.current || status !== 'playing') return;
       
       const { startSec, durationSec, channels } = lastMessage;
       const sampleRate = audioContextRef.current.sampleRate;
@@ -106,25 +112,18 @@ export default function ListenerView({
       source.playbackRate.value = playRef.current.rate;
       source.connect(gainNodeRef.current);
       
-      // Calculate exact start time
-      // The true zero-point of the track is T0 - startPos
-      const trackVirtualStart = playRef.current.serverTimestamp - (playRef.current.audioPosition * 1000 / playRef.current.rate);
+      // Calculate exact start time relative to the locked audio hardware clock
+      const chunkStartTime = baseAudioTimeRef.current + (startSec / playRef.current.rate);
       
-      // This chunk belongs at startSec
-      const chunkPlayAt = trackVirtualStart + (startSec * 1000 / playRef.current.rate);
-      const localPlayAt = chunkPlayAt + clockOffset;
-      const delaySeconds = (localPlayAt - Date.now()) / 1000;
-      
-      if (delaySeconds < 0) {
-        // Chunk is in the past, maybe partially playable
-        const timePassed = Math.abs(delaySeconds) * playRef.current.rate;
+      if (chunkStartTime < audioContextRef.current.currentTime) {
+        // Chunk is partially or fully in the past
+        const timePassed = (audioContextRef.current.currentTime - chunkStartTime) * playRef.current.rate;
         if (timePassed < durationSec) {
           source.start(audioContextRef.current.currentTime, timePassed);
           activeSourcesRef.current.add(source);
         }
       } else {
-        const startTime = audioContextRef.current.currentTime + delaySeconds;
-        source.start(startTime);
+        source.start(chunkStartTime);
         activeSourcesRef.current.add(source);
       }
       

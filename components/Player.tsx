@@ -38,6 +38,8 @@ export default function Player({
   // Streaming State
   const streamingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const streamPositionRef = useRef(0);
+  const streamBaseTimeRef = useRef<number>(0);
+  const streamStartPosRef = useRef<number>(0);
 
   // Playlist State
   const [playlist, setPlaylist] = useState<Track[]>([]);
@@ -160,7 +162,7 @@ export default function Player({
 
   // --- Live PCM Streaming Engine ---
   const STREAM_CHUNK_SEC = 0.1; // 100ms slices
-  const STREAM_LOOKAHEAD_SEC = 0.8; // Maintain 800ms buffer ahead
+  const STREAM_LOOKAHEAD_SEC = 1.5; // Maintain 1.5s buffer to survive 1000ms background tab throttling
   
   const sendNextPcmChunk = () => {
     const buffer = audioBufferRef.current;
@@ -174,16 +176,27 @@ export default function Player({
     const endSample = Math.min(Math.floor(endSec * buffer.sampleRate), buffer.length);
     const durationSec = (endSample - startSample) / buffer.sampleRate;
     
-    const channelsBase64 = [];
+    // Mixdown to Mono to permanently halve bandwidth and prevent Ably limits
+    const monoBuffer = new Float32Array(endSample - startSample);
     for (let i = 0; i < buffer.numberOfChannels; i++) {
       const channelData = buffer.getChannelData(i).subarray(startSample, endSample);
-      const u8 = new Uint8Array(channelData.buffer, channelData.byteOffset, channelData.byteLength);
-      let binary = '';
-      for (let j = 0; j < u8.length; j += 8000) {
-        binary += String.fromCharCode.apply(null, Array.from(u8.subarray(j, j + 8000)));
+      for (let j = 0; j < monoBuffer.length; j++) {
+        monoBuffer[j] += channelData[j];
       }
-      channelsBase64.push(btoa(binary));
     }
+    
+    if (buffer.numberOfChannels > 1) {
+      for (let j = 0; j < monoBuffer.length; j++) {
+        monoBuffer[j] /= buffer.numberOfChannels;
+      }
+    }
+
+    const u8 = new Uint8Array(monoBuffer.buffer, monoBuffer.byteOffset, monoBuffer.byteLength);
+    let binary = '';
+    for (let j = 0; j < u8.length; j += 8000) {
+      binary += String.fromCharCode.apply(null, Array.from(u8.subarray(j, j + 8000)));
+    }
+    const channelsBase64 = [btoa(binary)];
     
     broadcast({ 
       action: 'pcm_chunk', 
@@ -197,9 +210,20 @@ export default function Player({
   };
 
   const streamLoop = () => {
-    const hasMore = sendNextPcmChunk();
+    if (!audioBufferRef.current) return;
+    
+    // Calculate how far the stream SHOULD be right now
+    const realSecondsPassed = (Date.now() - streamBaseTimeRef.current) / 1000;
+    const targetStreamPosition = streamStartPosRef.current + (realSecondsPassed * playbackRate) + STREAM_LOOKAHEAD_SEC;
+    
+    let hasMore = true;
+    // Loop until we've sent all chunks up to the target lookahead.
+    // If the browser aggressively throttles the tab to 1000ms loop limits, this instantly catches up!
+    while (streamPositionRef.current < targetStreamPosition && hasMore) {
+       hasMore = sendNextPcmChunk();
+    }
+    
     if (hasMore) {
-      // Loop interval scales with playback rate so the network buffer doesn't starve when playing fast
       const nextCallMs = (STREAM_CHUNK_SEC * 1000) / playbackRate;
       streamingTimeoutRef.current = setTimeout(streamLoop, nextCallMs);
     }
@@ -208,16 +232,10 @@ export default function Player({
   const startStreaming = (startPos: number) => {
     stopStreaming();
     streamPositionRef.current = startPos;
+    streamStartPosRef.current = startPos;
+    streamBaseTimeRef.current = Date.now();
     
-    // Initial burst to build the lookahead buffer on listeners
-    const burstCount = Math.floor(STREAM_LOOKAHEAD_SEC / STREAM_CHUNK_SEC);
-    for (let i = 0; i < burstCount; i++) {
-       sendNextPcmChunk();
-    }
-    
-    // Start continuous loop
-    const nextCallMs = (STREAM_CHUNK_SEC * 1000) / playbackRate;
-    streamingTimeoutRef.current = setTimeout(streamLoop, nextCallMs);
+    streamLoop();
   };
 
   const stopStreaming = () => {
