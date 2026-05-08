@@ -3,10 +3,11 @@ import * as Ably from 'ably';
 import { measureClockOffset } from '../lib/sync-clock';
 
 export type SyncAction =
-  | { action: 'play'; audioPosition: number }
+  | { action: 'play'; audioPosition: number; playbackRate: number }
   | { action: 'pause'; audioPosition: number }
   | { action: 'seek'; audioPosition: number }
-  | { action: 'audio_chunk'; chunkIndex: number; totalChunks: number; data: string; mimeType: string; fileName: string };
+  | { action: 'pcm_chunk'; startSec: number; durationSec: number; channels: string[] }
+  | { action: 'sync_playlist'; playlist: { id: string; name: string }[]; currentIndex: number };
 
 export type SyncMessage = SyncAction & { serverTimestamp: number };
 
@@ -35,25 +36,31 @@ export function useSync(roomCode: string, role: 'host' | 'listener') {
       }
     });
 
-    measureClockOffset().then(offset => {
-      setClockOffset(offset);
-    });
+    const measure = () => {
+      measureClockOffset().then(offset => {
+        setClockOffset(offset);
+      });
+    };
+    
+    measure();
+    const syncInterval = setInterval(measure, 30000);
 
     channel.subscribe('sync', (msg) => {
       setLastMessage(msg.data as SyncMessage);
     });
 
     return () => { 
-      channel.presence.leave();
+      clearInterval(syncInterval);
+      channel.presence.leave().catch(() => {});
       ably.close(); 
     };
   }, [roomCode, role]);
 
-  const broadcast = (action: SyncAction) => {
+  const broadcast = (action: SyncAction, delayMs: number = 0) => {
     channelRef.current?.publish('sync', {
       ...action,
-      // serverTime = localTime - clockOffset
-      serverTimestamp: Date.now() - (clockOffset || 0)
+      // serverTime = localTime - clockOffset + delay
+      serverTimestamp: Date.now() - (clockOffset || 0) + delayMs
     });
   };
 

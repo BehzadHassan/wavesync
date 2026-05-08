@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { SyncMessage } from '../hooks/useSync';
 import { schedulePlay } from '../lib/audio-player';
-import { RadioReceiver, CheckCircle2, PlayCircle, Loader2, Volume2, VolumeX, Scan, Waves } from 'lucide-react';
+import { RadioReceiver, CheckCircle2, PlayCircle, Loader2, Volume2, VolumeX, Scan, Waves, ListMusic, Activity } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import WaveformVisualizer from './WaveformVisualizer';
 import OrbitalRings from './OrbitalRings';
@@ -16,14 +16,18 @@ export default function ListenerView({
   const [status, setStatus] = useState<'waiting' | 'receiving' | 'ready' | 'playing'>('waiting');
   const [fileName, setFileName] = useState<string>('');
   const audioContextRef = useRef<AudioContext | null>(null);
-  const audioBufferRef = useRef<AudioBuffer | null>(null);
   const gainNodeRef = useRef<GainNode | null>(null);
-  const sourceRef = useRef<AudioBufferSourceNode | null>(null);
-  const [downloadProgress, setDownloadProgress] = useState(0);
-  const chunksRef = useRef<string[]>([]);
   const [hasInteracted, setHasInteracted] = useState(false);
   const [volume, setVolume] = useState(0.8);
   const [muted, setMuted] = useState(false);
+
+  // Playback state
+  const playRef = useRef({ serverTimestamp: 0, audioPosition: 0, rate: 1 });
+  const activeSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
+
+  // Playlist state
+  const [playlist, setPlaylist] = useState<{id: string, name: string}[]>([]);
+  const [currentIndex, setCurrentIndex] = useState<number>(-1);
 
   useEffect(() => {
     const handleInteraction = () => {
@@ -55,57 +59,92 @@ export default function ListenerView({
   useEffect(() => {
     if (!lastMessage || clockOffset === null) return;
 
-    if (lastMessage.action === 'audio_chunk') {
-      setStatus('receiving');
-      setFileName(lastMessage.fileName);
-      chunksRef.current[lastMessage.chunkIndex] = lastMessage.data;
-      
-      const downloaded = chunksRef.current.filter(Boolean).length;
-      setDownloadProgress(Math.round((downloaded / lastMessage.totalChunks) * 100));
-
-      if (downloaded === lastMessage.totalChunks) {
-        const base64 = chunksRef.current.join('');
-        const binaryString = window.atob(base64);
-        const len = binaryString.length;
-        const bytes = new Uint8Array(len);
-        for (let i = 0; i < len; i++) {
-          bytes[i] = binaryString.charCodeAt(i);
-        }
-        
-        if (audioContextRef.current) {
-          audioContextRef.current.decodeAudioData(bytes.buffer).then(buffer => {
-            audioBufferRef.current = buffer;
-            setStatus('ready');
-            chunksRef.current = [];
-          });
-        }
-      }
-    } else if (lastMessage.action === 'play') {
+    if (lastMessage.action === 'sync_playlist') {
+      setPlaylist(lastMessage.playlist);
+      setCurrentIndex(lastMessage.currentIndex);
+    } 
+    else if (lastMessage.action === 'play') {
       if (audioContextRef.current?.state === 'suspended') {
         audioContextRef.current.resume();
       }
-
-      if (audioBufferRef.current && audioContextRef.current && gainNodeRef.current) {
-        if (sourceRef.current) sourceRef.current.stop();
-        
-        const source = audioContextRef.current.createBufferSource();
-        source.buffer = audioBufferRef.current;
-        source.connect(gainNodeRef.current);
-        
-        const localPlayAt = lastMessage.serverTimestamp + clockOffset;
-        const delaySeconds = (localPlayAt - Date.now()) / 1000;
-        const timePassed = delaySeconds < 0 ? Math.abs(delaySeconds) : 0;
-        const startTime = audioContextRef.current.currentTime + Math.max(0, delaySeconds);
-        source.start(startTime, lastMessage.audioPosition + timePassed);
-        
-        sourceRef.current = source;
-        setStatus('playing');
+      
+      playRef.current = {
+        serverTimestamp: lastMessage.serverTimestamp,
+        audioPosition: lastMessage.audioPosition,
+        rate: lastMessage.playbackRate || 1
+      };
+      
+      // Stop all currently scheduled chunks (if seeking)
+      activeSourcesRef.current.forEach(source => {
+        try { source.stop(); } catch(e) {}
+      });
+      activeSourcesRef.current.clear();
+      
+      setStatus('playing');
+    }
+    else if (lastMessage.action === 'pcm_chunk') {
+      if (!audioContextRef.current || !gainNodeRef.current) return;
+      
+      const { startSec, durationSec, channels } = lastMessage;
+      const sampleRate = audioContextRef.current.sampleRate;
+      const length = Math.floor(durationSec * sampleRate);
+      
+      const buffer = audioContextRef.current.createBuffer(channels.length, length, sampleRate);
+      
+      for (let i = 0; i < channels.length; i++) {
+        const binary = atob(channels[i]);
+        const u8 = new Uint8Array(binary.length);
+        for (let j = 0; j < binary.length; j++) {
+          u8[j] = binary.charCodeAt(j);
+        }
+        const f32 = new Float32Array(u8.buffer);
+        buffer.getChannelData(i).set(f32);
       }
+      
+      const source = audioContextRef.current.createBufferSource();
+      source.buffer = buffer;
+      source.playbackRate.value = playRef.current.rate;
+      source.connect(gainNodeRef.current);
+      
+      // Calculate exact start time
+      // The true zero-point of the track is T0 - startPos
+      const trackVirtualStart = playRef.current.serverTimestamp - (playRef.current.audioPosition * 1000 / playRef.current.rate);
+      
+      // This chunk belongs at startSec
+      const chunkPlayAt = trackVirtualStart + (startSec * 1000 / playRef.current.rate);
+      const localPlayAt = chunkPlayAt + clockOffset;
+      const delaySeconds = (localPlayAt - Date.now()) / 1000;
+      
+      if (delaySeconds < 0) {
+        // Chunk is in the past, maybe partially playable
+        const timePassed = Math.abs(delaySeconds) * playRef.current.rate;
+        if (timePassed < durationSec) {
+          source.start(audioContextRef.current.currentTime, timePassed);
+          activeSourcesRef.current.add(source);
+        }
+      } else {
+        const startTime = audioContextRef.current.currentTime + delaySeconds;
+        source.start(startTime);
+        activeSourcesRef.current.add(source);
+      }
+      
+      source.onended = () => {
+        activeSourcesRef.current.delete(source);
+      };
+      
     } else if (lastMessage.action === 'pause') {
-      if (sourceRef.current) {
-        sourceRef.current.stop();
-        setStatus('ready');
-      }
+      activeSourcesRef.current.forEach(source => {
+        try { source.stop(); } catch(e) {}
+      });
+      activeSourcesRef.current.clear();
+      setStatus('ready');
+      
+    } else if (lastMessage.action === 'seek') {
+      activeSourcesRef.current.forEach(source => {
+        try { source.stop(); } catch(e) {}
+      });
+      activeSourcesRef.current.clear();
+      setStatus('ready');
     }
   }, [lastMessage, clockOffset]);
 
@@ -118,14 +157,14 @@ export default function ListenerView({
     },
     receiving: {
       icon: <Loader2 className="text-cyan-400 animate-spin" size={48} />,
-      text: `Downloading Audio Stream`,
-      sub: `${downloadProgress}% complete`,
+      text: `Buffering Track`,
+      sub: `Optimizing stream...`,
       color: 'cyan',
     },
     ready: {
       icon: <CheckCircle2 className="text-green-400" size={48} />,
       text: 'Node Synchronized',
-      sub: 'Waiting for host to press play',
+      sub: 'Ready for live stream packets',
       color: 'green',
     },
     playing: {
@@ -189,82 +228,105 @@ export default function ListenerView({
           )}
         </AnimatePresence>
 
-        <div className="p-10 flex flex-col items-center justify-center text-center space-y-8 min-h-[420px]">
+        <div className="grid grid-cols-1 md:grid-cols-2">
           
-          {/* Central Visual */}
-          <div className="relative">
-            <OrbitalRings size={180} playing={status === 'playing'} />
-            <div className="absolute inset-0 flex items-center justify-center">
-              <div className="glass p-6 rounded-full neon-border">
-                <motion.div
-                  animate={status === 'playing' ? { scale: [1, 1.15, 1] } : {}}
-                  transition={{ repeat: Infinity, duration: 1.5 }}
-                >
-                  {statusConfig.icon}
-                </motion.div>
+          {/* Main Visualizer */}
+          <div className="p-8 flex flex-col items-center justify-center text-center space-y-8 border-b md:border-b-0 md:border-r border-white/5">
+            <div className="relative">
+              <OrbitalRings size={180} playing={status === 'playing'} />
+              <div className="absolute inset-0 flex items-center justify-center">
+                <div className="glass p-6 rounded-full neon-border">
+                  <motion.div
+                    animate={status === 'playing' ? { scale: [1, 1.15, 1] } : {}}
+                    transition={{ repeat: Infinity, duration: 1.5 }}
+                  >
+                    {statusConfig.icon}
+                  </motion.div>
+                </div>
               </div>
             </div>
-          </div>
-          
-          {/* Status Text */}
-          <div className="space-y-3">
-            <h3 className="text-2xl font-black tracking-[0.15em] uppercase text-transparent bg-clip-text bg-gradient-to-r from-white to-slate-400">
-              {statusConfig.text}
-            </h3>
-            <p className="text-xs text-slate-500 tracking-wider font-mono">{statusConfig.sub}</p>
             
-            {status === 'receiving' && (
-              <div className="w-48 mx-auto h-1.5 bg-black/60 rounded-full overflow-hidden border border-white/5 mt-4">
-                <motion.div 
-                  className="h-full bg-gradient-to-r from-cyan-400 to-blue-500 rounded-full"
-                  style={{ boxShadow: '0 0 12px rgba(34,211,238,0.5)' }}
-                  initial={{ width: 0 }}
-                  animate={{ width: `${downloadProgress}%` }}
+            <div className="space-y-3">
+              <h3 className="text-xl sm:text-2xl font-black tracking-[0.15em] uppercase text-transparent bg-clip-text bg-gradient-to-r from-white to-slate-400">
+                {statusConfig.text}
+              </h3>
+              <p className="text-[10px] sm:text-xs text-slate-500 tracking-wider font-mono uppercase">{statusConfig.sub}</p>
+            </div>
+
+            <div className="w-full px-4">
+              <WaveformVisualizer isActive={status === 'playing'} barCount={32} height={40} />
+            </div>
+
+            <div className="flex items-center justify-center gap-6 w-full">
+              <div className="flex items-center gap-3">
+                <button onClick={() => setMuted(!muted)} className="text-slate-400 hover:text-white transition-colors">
+                  {muted ? <VolumeX size={16} /> : <Volume2 size={16} />}
+                </button>
+                <input 
+                  type="range" min="0" max="1" step="0.01"
+                  value={muted ? 0 : volume}
+                  onChange={(e) => { setVolume(parseFloat(e.target.value)); setMuted(false); }}
+                  className="w-20 h-1 bg-white/10 rounded-full appearance-none cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-cyan-400 [&::-webkit-slider-thumb]:shadow-[0_0_8px_rgba(34,211,238,0.5)]"
                 />
               </div>
-            )}
+              
+              <div className="flex items-center gap-2 glass px-3 py-1.5 rounded-full">
+                <div className={`w-1.5 h-1.5 rounded-full ${clockOffset !== null ? 'bg-cyan-400 shadow-[0_0_6px_rgba(34,211,238,0.8)]' : 'bg-slate-600 animate-pulse'}`} />
+                <span className="text-[9px] font-mono tracking-widest text-slate-400 uppercase">
+                  {clockOffset !== null ? `±${Math.abs(clockOffset)}ms` : 'SYNCING'}
+                </span>
+              </div>
+            </div>
           </div>
 
-          {/* Waveform */}
-          <div className="w-full px-4">
-            <WaveformVisualizer isActive={status === 'playing'} barCount={48} height={50} />
-          </div>
-
-          {/* File info */}
-          <AnimatePresence>
-            {fileName && (
-              <motion.span
-                initial={{ opacity: 0, y: 10 }}
-                animate={{ opacity: 1, y: 0 }}
-                className="inline-flex items-center gap-2 px-4 py-2 bg-cyan-500/5 border border-cyan-500/15 rounded-full text-xs font-mono text-cyan-400 truncate max-w-[280px]"
-              >
-                <Waves size={12} />
-                {fileName}
-              </motion.span>
-            )}
-          </AnimatePresence>
-
-          {/* Volume + Sync Info */}
-          <div className="flex items-center justify-center gap-8 w-full">
-            <div className="flex items-center gap-3">
-              <button onClick={() => setMuted(!muted)} className="text-slate-400 hover:text-white transition-colors">
-                {muted ? <VolumeX size={16} /> : <Volume2 size={16} />}
-              </button>
-              <input 
-                type="range" min="0" max="1" step="0.01"
-                value={muted ? 0 : volume}
-                onChange={(e) => { setVolume(parseFloat(e.target.value)); setMuted(false); }}
-                className="w-24 h-1 bg-white/10 rounded-full appearance-none cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-cyan-400 [&::-webkit-slider-thumb]:shadow-[0_0_8px_rgba(34,211,238,0.5)]"
-              />
+          {/* Playlist Panel */}
+          <div className="flex flex-col bg-black/20">
+            <div className="flex items-center justify-between px-6 py-4 border-b border-white/5 bg-black/40">
+              <div className="flex items-center gap-2 text-cyan-400">
+                <ListMusic size={16} />
+                <span className="text-xs font-bold tracking-widest uppercase text-slate-300">Live Broadcast Queue</span>
+              </div>
             </div>
             
-            <div className="flex items-center gap-2 glass px-4 py-1.5 rounded-full">
-              <div className={`w-1.5 h-1.5 rounded-full ${clockOffset !== null ? 'bg-cyan-400 shadow-[0_0_6px_rgba(34,211,238,0.8)]' : 'bg-slate-600 animate-pulse'}`} />
-              <span className="text-[10px] font-mono tracking-widest text-slate-400 uppercase">
-                {clockOffset !== null ? `±${Math.abs(clockOffset)}ms` : 'SYNCING'}
-              </span>
+            <div className="flex-1 overflow-y-auto p-4 space-y-2 custom-scrollbar max-h-[300px] md:max-h-full">
+              {playlist.length === 0 ? (
+                <div className="h-full flex flex-col items-center justify-center text-center p-8 opacity-50">
+                  <Waves size={32} className="text-slate-600 mb-4" />
+                  <p className="text-xs text-slate-500 font-mono tracking-widest uppercase">Waiting for host to add tracks...</p>
+                </div>
+              ) : (
+                playlist.map((track, idx) => (
+                  <div 
+                    key={track.id}
+                    className={`flex items-center gap-3 px-4 py-3 rounded-xl transition-all ${
+                      currentIndex === idx 
+                        ? 'bg-cyan-500/10 border border-cyan-500/20 text-cyan-400 shadow-[inset_0_0_15px_rgba(34,211,238,0.1)]' 
+                        : 'bg-white/[0.02] border border-white/5 text-slate-400'
+                    }`}
+                  >
+                    <div className="w-4 flex justify-center">
+                      {currentIndex === idx ? (
+                        <Activity size={14} className={status === 'playing' ? 'animate-pulse text-cyan-400' : 'text-cyan-500/50'} />
+                      ) : (
+                        <span className="text-[10px] font-mono text-slate-600">{idx + 1}</span>
+                      )}
+                    </div>
+                    <span className="text-xs font-mono truncate">{track.name}</span>
+                  </div>
+                ))
+              )}
+            </div>
+
+            <div className="border-t border-white/5 bg-black/60 p-4">
+              <div className="flex flex-col gap-1">
+                <span className="text-[9px] text-slate-600 font-bold uppercase tracking-[0.2em]">Currently Selected</span>
+                <span className="text-xs font-mono text-cyan-400 truncate">
+                  {currentIndex >= 0 && playlist[currentIndex] ? playlist[currentIndex].name : 'None'}
+                </span>
+              </div>
             </div>
           </div>
+
         </div>
       </div>
     </div>
